@@ -2,3 +2,13 @@ COPYRIGHT : (C) 2004 Luc Yriarte
 
 CardBeam is free software. As such, it comes with NO WARRANTY OF ANY KIND. You are free to use and redistribute this software and the source code as long as this license is included.
 
+Using CardBeam:
+
+Use a card reader to put text files, prcs, virtual calendar or virtual contact files in directory "/Palm/Programs/CardBeam".
+CardBeam will send the selected component to the relevant application according to the file extension.
+
+- .prc files are handled by Launcher.
+- .txt files are handled by Memo.
+- .vcf files are handled by Address book.
+- .vcs files are handled either by Datebook or Todo.
+

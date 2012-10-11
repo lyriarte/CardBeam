@@ -14,6 +14,7 @@
 
 #include <PalmOS.h>
 #include <VFSMgr.h>
+#include <ExgLocalLib.h>
 #include <TraceMgr.h>
 
 #include "CardBeam.h"
@@ -26,6 +27,8 @@
  ***********************************************************************/
 
 #define sysFileCCardBeam			'CaBe'
+#define kPalmDirPath				"/Palm"
+#define kProgramsDirPath			"/Palm/Programs"
 #define kCardBeamDirPath			"/Palm/Programs/CardBeam"
 #define kFileNameSize				256
 #define kMaxFileIndex				0xffff
@@ -39,6 +42,7 @@
 static UInt16 sVolRefNum, sCurrentFileIndex, sTopVisibleFileIndex; 
 static Char sFileNameBuf[kFileNameSize];
 static FileInfoType sFileInfo;
+static MemHandle sCurrentFileNameH;
 
 
 /***********************************************************************
@@ -65,10 +69,10 @@ static UInt16 StartApplication (void)
 	UInt16 err = errNone;
 
 	err = FtrGet(sysFileCVFSMgr, vfsFtrIDVersion, &vfsMgrVersion);
-	ErrNonFatalDisplayIf(err != errNone, "Virtual File System Manager not found");
 	if (err)
 		goto Exit;
 
+	sCurrentFileNameH = NULL;
 	sCurrentFileIndex = kMaxFileIndex;
 	sTopVisibleFileIndex = 0;
 
@@ -77,6 +81,8 @@ static UInt16 StartApplication (void)
 		err = VFSVolumeEnumerate(&sVolRefNum, &volIterator);
 		if (err == errNone)
 		{
+			err = VFSDirCreate(sVolRefNum, kPalmDirPath);
+			err = VFSDirCreate(sVolRefNum, kProgramsDirPath);
 			err = VFSDirCreate(sVolRefNum, kCardBeamDirPath);
 			if (err == vfsErrFileAlreadyExists)
 				err = errNone;
@@ -85,7 +91,6 @@ static UInt16 StartApplication (void)
 	}
 
 Exit:
-	ErrNonFatalDisplayIf(err != errNone, "Card not found, CardBeam exiting.");
 	return err;
 }
 
@@ -109,6 +114,112 @@ static UInt16 StopApplication (void)
 	return err;
 }
 
+
+/***********************************************************************
+ *
+ * FUNCTION:    CardBeamSendFile
+ *
+ * DESCRIPTION: Default cleanup code for the CardBeam application.
+ *
+ * PARAMETERS:  none
+ *
+ * RETURNED:    error code
+ *
+
+typedef struct ExgSocketType {
+	UInt16	libraryRef;	// identifies the Exg library in use
+	UInt32 	socketRef;	// used by Exg library to identify this connection
+	UInt32 	target;		// Creator ID of application this is sent to
+	UInt32	count;		// # of objects in this connection (usually 1)
+	UInt32	length;		// # total byte count for all objects being sent (optional)
+	UInt32	time;		// last modified time of object (optional)
+	UInt32	appData;	// application specific info
+	UInt32 	goToCreator; // creator ID of app to launch with goto after receive
+	ExgGoToType goToParams;	// If launchCreator then this contains goto find info
+	UInt16	localMode:1; // Exchange with local machine only mode 
+	UInt16	packetMode:1;// Use connectionless packet mode (Ultra)
+	UInt16	noGoTo:1; 	// Do not go to app (local mode only)
+	UInt16 	noStatus:1; // Do not display status dialogs
+	UInt16 	preview:1;	// Preview in progress: don't throw away data as it's read
+	UInt16	reserved:11;// reserved system flags
+	Char *description;	// text description of object (for user)
+	Char *type;		// Mime type of object (optional)
+	Char *name;		// name of object, generally a file name (optional)
+} ExgSocketType;
+
+ ***********************************************************************/
+
+static UInt16 CardBeamSendFile (void)
+{
+	FileRef fileRef;
+	MemHandle fileDataH;
+	Char * filePathP, * fileNameP;
+	void * fileDataP;
+	UInt32 fileSize;
+	UInt16 err = errNone;
+	ExgSocketType exgSocket;
+
+TraceOutput(TL(appErrorClass, "CardBeamSendFile"));
+
+	fileNameP = (Char*) MemHandleLock(sCurrentFileNameH);
+	filePathP = MemPtrNew(2 + StrLen(kCardBeamDirPath) + StrLen(fileNameP));
+	StrCopy(filePathP, kCardBeamDirPath);
+	StrCat(filePathP, "/");
+	StrCat(filePathP, fileNameP);
+	StrCopy(sFileNameBuf, exgLocalPrefix);
+	StrCat(sFileNameBuf, fileNameP);
+	MemHandleUnlock(sCurrentFileNameH);
+
+TraceOutput(TL(appErrorClass, "CardBeamSendFile opening %s", filePathP));
+
+	err = VFSFileOpen(sVolRefNum, filePathP, vfsModeRead, &fileRef);
+	if (err != errNone)
+		goto CloseFile;
+
+TraceOutput(TL(appErrorClass, "CardBeamSendFile %s opened", filePathP));
+
+	err = VFSFileSize(fileRef, &fileSize);
+	if (err != errNone)
+		goto CloseFile;
+
+TraceOutput(TL(appErrorClass, "CardBeamSendFile %s size %lu", filePathP, fileSize));
+
+	fileDataH = MemHandleNew(fileSize);
+	if (!fileDataH)
+	{
+		err = dmErrMemError;
+		goto CloseFile;
+	}
+
+	fileDataP = MemHandleLock(fileDataH);
+	err = VFSFileRead(fileRef, fileSize, fileDataP, NULL);
+	if (err != errNone)
+		goto FreeHandle;
+
+	MemSet(&exgSocket, sizeof(exgSocket), 0);
+	exgSocket.name = sFileNameBuf;
+
+	err = ExgPut(&exgSocket);
+	if (err != errNone)
+		goto FreeHandle;
+
+	do {
+		fileSize -= ExgSend(&exgSocket, fileDataP, fileSize, &err);
+		((UInt8*)fileDataP) += fileSize;
+	} while (fileSize && err == errNone);
+
+	err = ExgDisconnect(&exgSocket, err);
+
+FreeHandle:
+	MemHandleUnlock(fileDataH);
+	MemHandleFree(fileDataH);
+CloseFile:
+	MemPtrFree(filePathP);
+	VFSFileClose(fileRef);
+Exit:
+	return err;
+}
+
 /***********************************************************************
  *
  * FUNCTION:	ListViewDrawRecord
@@ -127,6 +238,8 @@ static void ListViewDrawRecord (void * tblP, Int16 row, Int16 col, RectanglePtr 
 	Char * fileNameP;
 	UInt16 err = errNone;
 	UInt16 nameLen;
+
+TraceOutput(TL(appErrorClass, "ListViewDrawRecord"));
 
 	fileNameH = (MemHandle) TblGetRowData(tblP, row);
 	if (!fileNameH)
@@ -183,23 +296,24 @@ static void ListViewLoadTable (FormPtr frmP)
 	TablePtr tblP;
 	FileRef cardBeamDirRef;
 	MemHandle fileNameH;
-	UInt32 fileRef;
+	UInt32 fileIterator;
 	UInt16 fileIndex, nRows, row;
 	UInt16 err = errNone;
+
+TraceOutput(TL(appErrorClass, "ListViewLoadTable"));
 
 	tblP = FrmGetObjectPtr(frmP, FrmGetObjectIndex(frmP, CardTable));
 
 	fileIndex = 0;
-	fileRef = vfsIteratorStart;
+	fileIterator = vfsIteratorStart;
 	err = VFSFileOpen(sVolRefNum, kCardBeamDirPath, vfsModeRead, &cardBeamDirRef);
-	ErrNonFatalDisplayIf(err != errNone, "Can't open CardBeam folder");
 
 	while (fileIndex < sTopVisibleFileIndex)
 	{
 		sFileInfo.attributes = 0;
 		sFileInfo.nameP = sFileNameBuf;
 		sFileInfo.nameBufLen = kFileNameSize;
-		err = VFSDirEntryEnumerate(cardBeamDirRef, &fileRef, &sFileInfo);
+		err = VFSDirEntryEnumerate(cardBeamDirRef, &fileIterator, &sFileInfo);
 		if (err == errNone)
 			fileIndex++;
 		else
@@ -212,11 +326,11 @@ static void ListViewLoadTable (FormPtr frmP)
 		sFileInfo.attributes = 0;
 		sFileInfo.nameP = sFileNameBuf;
 		sFileInfo.nameBufLen = kFileNameSize;
-		err = VFSDirEntryEnumerate(cardBeamDirRef, &fileRef, &sFileInfo);
+		err = VFSDirEntryEnumerate(cardBeamDirRef, &fileIterator, &sFileInfo);
 		if (err == errNone)
 		{
 			// Initialize row and force redraw only if this row has changed
-			if ((fileNameH = (MemHandle)TblGetRowData(tblP, row)) != NULL)
+			if ((fileNameH = (MemHandle) TblGetRowData(tblP, row)) != NULL)
 				MemHandleFree(fileNameH);
 
 			fileNameH = MemHandleNew(sFileInfo.nameBufLen);
@@ -235,8 +349,7 @@ static void ListViewLoadTable (FormPtr frmP)
 		}
 	}
 
-	err = VFSFileClose(cardBeamDirRef);
-	ErrNonFatalDisplayIf(err != errNone, "Can't close CardBeam folder");
+	VFSFileClose(cardBeamDirRef);
 	TblDrawTable(tblP);
 	ListViewUpdateScrollers(frmP, sTopVisibleFileIndex, fileIndex-1);
 }
@@ -300,7 +413,7 @@ static void ListViewSave (FormPtr frmP)
 
 	for (row = 0; row < nRows; row++)
 	{
-		if ((fileNameH = (MemHandle)TblGetRowData(tblP, row)) != NULL)
+		if ((fileNameH = (MemHandle) TblGetRowData(tblP, row)) != NULL)
 			MemHandleFree(fileNameH);
 	}
 }
@@ -358,6 +471,7 @@ static Boolean ListViewHandleEvent (EventType * evtP)
 {
 	FormPtr frmP;
 	TablePtr tblP;
+	UInt16 err = errNone;
 	Boolean handled = false;
 
 	switch (evtP->eType)
@@ -377,7 +491,8 @@ static Boolean ListViewHandleEvent (EventType * evtP)
 		case tblSelectEvent:
 			frmP = FrmGetActiveForm();
 			tblP = FrmGetObjectPtr(frmP, FrmGetObjectIndex(frmP, CardTable));
-			sCurrentFileIndex = TblGetRowData(tblP, evtP->data.tblSelect.row);
+			sCurrentFileIndex = TblGetRowID(tblP, evtP->data.tblSelect.row);
+			sCurrentFileNameH = (MemHandle) TblGetRowData(tblP, evtP->data.tblSelect.row);
 			handled = true;
 		break;
 
@@ -385,6 +500,9 @@ static Boolean ListViewHandleEvent (EventType * evtP)
 			switch (evtP->data.ctlSelect.controlID)
 			{
 				case BeamButton:
+					if (sCurrentFileIndex == kMaxFileIndex)
+						break;
+					err = CardBeamSendFile();
 					handled = true;
 				break;
 			}
