@@ -5,6 +5,9 @@ clean:
 
 force:	clean	all
 
+archive:	force
+	rm -f *.res *.bin *.grc *.o CardBeam
+
 bin.res:	CardBeam.rcp
 	rm -f *.res *.bin
 	pilrc CardBeam.rcp
